@@ -1,7 +1,8 @@
 package Catalyst::View::JSON;
 
 use strict;
-our $VERSION = '0.35';
+use warnings;
+our $VERSION = '0.36';
 use 5.008_001;
 
 use base qw( Catalyst::View );
@@ -9,7 +10,10 @@ use Encode ();
 use MRO::Compat;
 use Catalyst::Exception;
 
-__PACKAGE__->mk_accessors(qw( allow_callback callback_param expose_stash encoding json_dumper no_x_json_header json_encoder_args ));
+__PACKAGE__->mk_accessors(qw(
+  allow_callback callback_param expose_stash
+  encoding json_dumper no_x_json_header json_encoder_args
+  use_force_bom));
 
 sub new {
     my($class, $c, $arguments) = @_;
@@ -29,12 +33,6 @@ sub new {
             $c->log->debug("Unknown config parameter '$field'");
         }
     }
-
-    my $method = $self->can('encode_json');
-    $self->json_dumper( sub {
-                            my($data, $self, $c) = @_;
-                            $method->($self, $c, $data);
-                        } );
 
     if (my $method = $self->can('encode_json')) {
         $self->json_dumper( sub {
@@ -67,7 +65,8 @@ sub process {
         } elsif (!ref($expose)) {
             $single_key = $expose;
         } else {
-            $c->log->warn("expose_stash should be an array referernce or Regexp object.");
+            $c->log->warn("expose_stash should be an array reference, Regexp object, or key for a single stash entry.");
+            $c->log->warn("Returning all stash entries");
         }
     }
 
@@ -84,8 +83,6 @@ sub process {
     my $cb = $cb_param ? $c->req->param($cb_param) : undef;
     $self->validate_callback_param($cb) if $cb;
 
-    my $json = $self->json_dumper->($data, $self, $c); # weird order to be backward compat
-
     # When you set encoding option in View::JSON, this plugin DWIMs
     my $encoding = $self->encoding || 'utf-8';
 
@@ -95,12 +92,13 @@ sub process {
         $c->res->header('X-JSON' => 'eval("("+this.transport.responseText+")")');
     }
 
+    my $json = $self->render($c, $data);
     my $output;
 
-    ## add UTF-8 BOM if the client is Safari
-    if ($encoding eq 'utf-8') {
+    ## add UTF-8 BOM if the client meets a test and the application wants it.
+    if ($self->use_force_bom && $encoding eq 'utf-8') {
         my $user_agent = $c->req->user_agent || '';
-        if ($user_agent =~ m/\bSafari\b/ and $user_agent !~ m/\bChrome\b/) {
+        if ($self->user_agent_bom_test($user_agent)) {
             $output = "\xEF\xBB\xBF";
         }
     }
@@ -111,6 +109,23 @@ sub process {
 
     $c->res->output($output);
 }
+
+# allow for called as $c, $template, $data || $c, $data so that we are compatible
+# with the semi standard render method that a lot of views use.
+
+sub render {
+    my $self = shift;
+    my $c = shift;
+    my $data = pop;
+
+    return $self->json_dumper->($data, $self, $c); # weird order to be backward compat
+}
+
+sub user_agent_bom_test {
+    my ($self, $user_agent) = @_;
+    return(($user_agent =~ m/\bSafari\b/) and ($user_agent !~ m/\bChrome\b/));
+}
+
 
 sub validate_callback_param {
     my($self, $param) = @_;
@@ -184,7 +199,7 @@ exposed as a JSON response. Defaults to everything. Examples configuration:
 Suppose you have data structure of the following.
 
   $c->stash->{foo} = [ 1, 2 ];
-  $c->stash->{bar} = [ 3, 4 ];
+  $c->stash->{bar} = 2;
 
 By default, this view will return:
 
@@ -215,7 +230,36 @@ behavior so that you can do eval() by your own. Defaults to 0.
 An optional hashref that supplies arguments to L<JSON::MaybeXS> used when creating
 a new object.
 
+=item use_force_bom
+
+If versions of this view older than 0.36, there was some code that added a UTF-8 BOM
+marker to the end of the JSON string when the user agent was Safari.  After looking
+at a lot of existing code I don't think this is needed anymore so we removed it by
+default.  However if this turns out to be a problem you can re enable it by setting
+this attribute to true.  Possible a breaking change so we offer this workaround.
+
+You may also override the method 'user_agent_bom_test' which received the current
+request user agent string to try and better determine if this is needed.  Patches
+for this welcomed.
+
 =back
+
+=head1 METHODS
+
+=head2 process
+
+Standard target of $c->forward used to prepare a response
+
+=head2 render
+
+The methods accepts either of the following argument signatures in order to promote
+compatibility with the semi standard render method as define in numerous L<Catalyst>
+views on CPAN:
+
+    my $json_string = $c->view('JSON')->render($c, undef, $data);
+    my $json_string = $c->view('JSON')->render($c, $data);
+
+Given '$data' returns the JSON serialized version, or throws and error.
 
 =head1 OVERRIDING JSON ENCODER
 
@@ -261,7 +305,7 @@ this default via the C<json_encoder_args>:
     MyApp::View::JSON->config(
       json_encoder_args => +{utf8=>0} );
 
-B<NOTE>In 2015 the use of UTF8 as encoding is widely standard so it
+B<NOTE> In 2015 the use of UTF8 as encoding is widely standard so it
 is very likely you should need to do nothing to get the correct
 encoding.  The following documention will remain for historical
 value and backcompat needs.
@@ -330,6 +374,9 @@ C<validate_callback_param> method in your View::JSON class.
 See L<http://developer.yahoo.net/common/json.html> and
 L<http://ajaxian.com/archives/jsonp-json-with-padding> for more about
 JSONP.
+
+B<NOTE> For another way to enable JSONP in your application take a look
+at L<Plack::Middleware::JSONP>
 
 =head1 INTEROPERABILITY
 
@@ -436,11 +483,11 @@ it under the same terms as Perl itself.
 Following people has been contributing patches, bug reports and
 suggestions for the improvement of Catalyst::View::JSON.
 
-John Wang
-kazeburo
-Daisuke Murase
-Jun Kuriyama
-Tomas Doran
+  John Wang
+  kazeburo
+  Daisuke Murase
+  Jun Kuriyama
+  Tomas Doran
 
 =head1 SEE ALSO
 
